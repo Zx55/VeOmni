@@ -101,6 +101,23 @@ def flex_attention_mask_builder(
     ``create_block_mask`` is compiled by default so the eager dense
     ``[B, H, Q, KV]`` materialization can be fused. Pass
     ``compile_block_mask=False`` to keep the uncompiled path.
+
+    Keep ``mask_function`` a fixed predicate. Put per-step geometry in
+    captured tensors (document ids, span ids, ``cu_seqlens``) and reuse the
+    same callable. FA4 compiles ``mask_mod`` with ``dynamic=False`` and
+    specializes on Python constants. A new closure that bakes changing
+    range endpoints as ints retraces CuteDSL on every unique layout.
+
+    A packed prefix-plus-causal mask can keep one callable and refresh two
+    ``int32 [S]`` buffers each step::
+
+        def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+            same_document = document_ids[q_idx] == document_ids[kv_idx]
+            causal = q_idx >= kv_idx
+            same_full_span = (full_span_ids[q_idx] >= 0) & (
+                full_span_ids[q_idx] == full_span_ids[kv_idx]
+            )
+            return same_document & (causal | same_full_span)
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:

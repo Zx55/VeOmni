@@ -101,6 +101,29 @@ because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
 LSE renormalization, so they stay on Triton unless FLASH was forced, which
 is rejected.
 
+Keep `mask_mod` / `mask_function` a fixed predicate. Encode per-batch
+geometry in captured tensors such as document ids, span ids, or
+`cu_seqlens`, and reuse the same callable. FA4 lowers `mask_mod` into
+CuteDSL with `dynamic=False`, so Python constants inside the predicate are
+compile-time specializations. Baking a new split as `q < 256` retraces on
+every unique layout. Changing tensor *values* with the same program does
+not. `flex_attention_mask_builder` compiles `create_block_mask` around
+whatever callable the caller passes. It does not rewrite a per-step range
+list into a stable predicate.
+
+A packed prefix-plus-causal mask can keep one callable and refresh two
+`int32 [S]` buffers each step:
+
+```python
+def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+    same_document = document_ids[q_idx] == document_ids[kv_idx]
+    causal = q_idx >= kv_idx
+    same_full_span = (full_span_ids[q_idx] >= 0) & (
+        full_span_ids[q_idx] == full_span_ids[kv_idx]
+    )
+    return same_document & (causal | same_full_span)
+```
+
 ## MagiAttention mask and execution contract
 
 `magi_attention_forward` requires a caller-owned `MagiAttentionMask`:
@@ -194,7 +217,9 @@ Before enabling `attn_implementation: flex_attention` for a new model:
 2. Preserve the model's complete visibility contract in a native `BlockMask`.
    Full attention, sliding windows, bidirectional regions, packed-sample
    boundaries, prefix rules, and cache offsets remain model-owned semantics;
-   the generic VeOmni FlexAttention adapter does not recreate them.
+   the generic VeOmni FlexAttention adapter does not recreate them. Prefer a
+   fixed `mask_mod` that gathers per-token metadata over a new Python-constant
+   closure on every batch.
 3. If VeOmni packing or Ulysses changes the mask inputs, replace the relevant
    Transformers mask-helper imports in the patchgen config and pass the
    required metadata through the generated model forward. Packed boundaries
