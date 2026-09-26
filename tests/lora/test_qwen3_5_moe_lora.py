@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import torch
+import torch.nn as nn
 import yaml
 
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
@@ -22,9 +24,14 @@ _DENSE_TARGETS = {
     "out_proj",
 }
 _SEMANTIC_EXPERT_TARGETS = {"gate_proj", "up_proj", "down_proj"}
-_CONDITIONAL_EXPERT_PATTERNS = [
+_CONDITIONAL_FOUNDATION_EXPERT_PATTERNS = [
     "model.language_model.layers.*.mlp.experts.gate_up_proj",
     "model.language_model.layers.*.mlp.experts.down_proj",
+]
+_CONDITIONAL_EXPERT_PATTERNS = [
+    *_CONDITIONAL_FOUNDATION_EXPERT_PATTERNS,
+    "mtp.layers.*.mlp.experts.gate_up_proj",
+    "mtp.layers.*.mlp.experts.down_proj",
 ]
 _CAUSAL_EXPERT_PATTERNS = [
     "model.layers.*.mlp.experts.gate_up_proj",
@@ -67,6 +74,47 @@ def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_all_architectu
         assert parameters == expected_patterns
 
 
+def test_qwen3_5_moe_wrapped_mapping_omits_mtp_experts_without_mtp_module():
+    from veomni.models.transformers.qwen3_5_moe import register_qwen3_5_moe_modeling
+
+    model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
+    model = type("ModelWithoutMTP", (), {"mtp": None})()
+    _, parameters = model_cls._convert_lora_targets_to_parameters(
+        model, [*_DENSE_TARGETS, *_SEMANTIC_EXPERT_TARGETS], []
+    )
+    assert parameters == _CONDITIONAL_FOUNDATION_EXPERT_PATTERNS
+
+
+def _fused_expert_layer():
+    experts = nn.Module()
+    experts.gate_up_proj = nn.Parameter(torch.empty(2, 4, 3))
+    experts.down_proj = nn.Parameter(torch.empty(2, 3, 4))
+    layer = nn.Module()
+    layer.mlp = nn.Module()
+    layer.mlp.experts = experts
+    return layer
+
+
+def test_qwen3_5_moe_wrapped_mapping_includes_mtp_experts_when_present():
+    from veomni.models.transformers.qwen3_5_moe import register_qwen3_5_moe_modeling
+
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.language_model = nn.Module()
+    model.model.language_model.layers = nn.ModuleList([_fused_expert_layer()])
+    model.mtp = nn.Module()
+    model.mtp.layers = nn.ModuleList([_fused_expert_layer()])
+
+    model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
+    model._convert_lora_targets_to_parameters = model_cls._convert_lora_targets_to_parameters
+    lora_modules = [*_DENSE_TARGETS, *_SEMANTIC_EXPERT_TARGETS]
+    _, parameters = model._convert_lora_targets_to_parameters(model, lora_modules, [])
+    assert parameters == _CONDITIONAL_EXPERT_PATTERNS
+
+    resolved = resolve_fused_moe_lora_targets(model, {"lora_modules": lora_modules})
+    assert resolved["target_parameters"] == _CONDITIONAL_EXPERT_PATTERNS
+
+
 def test_qwen3_5_moe_production_config_injects_all_targets_and_freezes_base_model():
     """Verify the production config injects every target and freezes base weights."""
     model = build_lora_test_model(
@@ -79,7 +127,7 @@ def test_qwen3_5_moe_production_config_injects_all_targets_and_freezes_base_mode
     resolved = resolve_fused_moe_lora_targets(model, _production_lora_config())
 
     assert set(resolved["lora_modules"]) == _DENSE_TARGETS
-    assert resolved["target_parameters"] == _CONDITIONAL_EXPERT_PATTERNS
+    assert resolved["target_parameters"] == _CONDITIONAL_FOUNDATION_EXPERT_PATTERNS
 
     wrapped = VeOmniLoraModel(model, VeOmniLoraConfig.from_yaml(resolved))
     dense_fqns = wrapped.base_model.wrapped_dense

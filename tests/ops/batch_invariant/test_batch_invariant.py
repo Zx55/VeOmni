@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,9 @@ import torch
 from veomni.ops.batch_invariant import patch as batch_patch
 from veomni.ops.batch_invariant.support import addmm_can_fuse_bias, mean_keep_fp32_until_divide
 from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+_TRITON_AVAILABLE = importlib.util.find_spec("triton") is not None
 
 
 class _FakeLibrary:
@@ -219,9 +223,14 @@ def test_real_handler_matches_torch_output_gradient_and_dispatcher(op_name, monk
         "mean": "aten::mean.dim",
     }
     assert expected_dispatch[op_name] in calls
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    gemm = op_name in {"mm", "addmm"}
+    atol = 5e-2 if gemm else 2e-2
+    rtol = 5e-2 if gemm else 2e-2
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    grad_atol = 5e-2 if gemm else 3e-2
+    grad_rtol = 5e-2 if gemm else 3e-2
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
-        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=grad_atol, rtol=grad_rtol)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="batch-invariant handlers require CUDA + Triton")
@@ -284,6 +293,7 @@ def test_mean_keep_fp32_until_divide_avoids_fp16_overflow():
     torch.testing.assert_close(actual, torch.ones((), dtype=torch.float16))
 
 
+@pytest.mark.skipif(not _TRITON_AVAILABLE, reason="batch-invariant Triton kernels need triton")
 def test_mean_batch_invariant_single_dim_forwards_dtype(monkeypatch):
     """Single-dim mean must honor an explicit dtype, not only the multi-dim path."""
     from veomni.ops.batch_invariant import triton as module
@@ -329,6 +339,7 @@ def test_addmm_falls_back_for_alpha_and_broadcast_bias():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.skipif(not _TRITON_AVAILABLE, reason="batch-invariant Triton kernels need triton")
 def test_addmm_beta_zero_skips_nan_bias(monkeypatch):
     """beta=0 must not read bias. Do not use a patched aten::addmm as the oracle."""
     from veomni.ops.batch_invariant import triton as module

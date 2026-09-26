@@ -101,7 +101,10 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
     batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
-    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(cu_seq_lens_q)
+    # Slice conversion is host-side. Compile/GPU callers may already have moved
+    # ``cu_seq_lens_q``; copy rather than reject, matching DSV4's fallback.
+    host_cu = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
+    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(host_cu)
     attention_mask = batch.get("attention_mask")
     if isinstance(attention_mask, torch.Tensor) and attention_mask.device.type == "cpu":
         batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
@@ -146,6 +149,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
@@ -459,6 +463,7 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 

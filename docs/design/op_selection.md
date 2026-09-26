@@ -211,7 +211,7 @@ policy, and SP reduction are outside the op in
 `models/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
 causal-only.
 
-Selecting `liger_kernel` requires that the model's forward pass pass
+Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE implementation does the
 projection itself and has no full logits tensor to fall back on. VeOmni's
@@ -653,4 +653,4 @@ model:
 
 - Breaking change map from OpSlot / `kernel_registry`: [`opslot_to_veomniop.md`](opslot_to_veomniop.md)
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
-- Package layout and registration: [`veomni/ops/README.md`](../../veomni/ops/README.md)
+- Package layout and registration: `veomni/ops/README.md`

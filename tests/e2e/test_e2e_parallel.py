@@ -8,11 +8,12 @@ import pytest
 import torch
 import yaml
 
+from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
-from ..tools.training_utils import build_hf_reference_model
+from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
@@ -85,10 +86,12 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
     # comparisons flaky at the toy-config scale (CI hit a seed where the EP=2 vs
     # EP=1 step-2 grad_norm diff was 0.69, blowing past the 0.1 atol+rtol envelope).
     torch.manual_seed(0)
-    model = build_hf_reference_model(
-        config_path,
+    model = build_foundation_model(
+        config_path=config_path,
+        weights_path=None,
         torch_dtype="float32",
         init_device="cpu",
+        ops_implementation=make_eager_ops_config(),
     )
 
     model.save_pretrained(output_path, save_original_format=save_original_format)
@@ -110,17 +113,7 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
-    #
-    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
-    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
-    #   Disable save_original_format to save in native stacked format.
-    #
-    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
-    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
-    save_original_format = model_name != "qwen3_5_moe"
-    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
+    _materialize_weights_dir(config_path, test_path)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
@@ -708,6 +701,27 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
             "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        model_path="./deepseek_v4",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v4",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
 
 
 @_gpt_oss_fa4_quack_skip

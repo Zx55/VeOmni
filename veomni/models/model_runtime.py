@@ -404,6 +404,7 @@ class VeOmniModelRuntime:
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,
             **kwargs,
         )
@@ -568,6 +569,19 @@ class VeOmniModelRuntime:
         """Write this model's resumable checkpoint for ``state.global_step``."""
         self.checkpoint.save_dcp(state)
 
+    def extra_state(self) -> Dict[str, Any]:
+        """Model-bound state to persist beside the weights.
+
+        Models with extra state (e.g. the DiT condition model's noise/timestep
+        generator) contribute it here. The checkpoint manager merges the result
+        into the model's extra_state blob. Default: nothing.
+        """
+        return {}
+
+    def load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        """Restore what :meth:`extra_state` produced. Default: nothing."""
+        return
+
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
         """Export this model in whichever format it was trained in.
 
@@ -586,7 +600,7 @@ class VeOmniModelRuntime:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
         if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)

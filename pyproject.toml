@@ -62,6 +62,7 @@ gpu = [
   # x86_64/aarch64.
   "flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn-3; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
+  "kernels==0.16.0; sys_platform == 'linux'",
   "flash-mla; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
   # and not yet published as a package release.
@@ -359,9 +360,6 @@ exclude = [
 ]
 
 [tool.setuptools.package-data]
-# LTX-2.3 reads its default Gemma system prompts from disk at import-adjacent
-# runtime (`veomni/models/diffusers/ltx2_3/.../encoders/prompts/*.txt`), so they
-# have to travel with the package instead of only living in the git checkout.
 veomni = ["**/*.txt"]
 
 [tool.patchgen]
@@ -401,6 +399,10 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.pytest.ini_options]
+# GPU CI images ship pytest 8, whose default importmode=prepend puts the test
+# directory ahead of the repo root. `from tests...` then fails unless the root
+# is on sys.path. NPU CI still uses pytest 7.4, which already resolved `tests`.
+pythonpath = ["."]
 markers = [
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
