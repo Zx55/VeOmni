@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import partial
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -30,11 +31,22 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
+from .....utils.device import get_gpu_compute_capability
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
 
 
 _COMPILED_CREATE_BLOCK_MASK = None
+_SM100_BLOCK_SIZE = (256, 128)
+_DEFAULT_BLOCK_SIZE = 128
+
+
+def _flex_block_size(device: torch.device | str | int | None) -> int | tuple[int, int]:
+    """Use FA4's SM100 Q tile, and retain the default size elsewhere."""
+    if device is not None and torch.device(device).type == "cuda" and torch.version.hip is None:
+        if get_gpu_compute_capability(device) >= 100:
+            return _SM100_BLOCK_SIZE
+    return _DEFAULT_BLOCK_SIZE
 
 
 def _compiled_create_block_mask():
@@ -58,14 +70,15 @@ def _eager_create_block_mask(*args, **kwargs):
 
 
 @contextmanager
-def _patched_hf_create_block_mask(compile_block_mask: bool) -> Iterator[None]:
+def _patched_hf_create_block_mask(compile_block_mask: bool, block_size: int | tuple[int, int]) -> Iterator[None]:
     """Swap HF's ``create_block_mask`` for the compiled or eager path.
 
     Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
     path cannot use the raw function or the flag would compile anyway.
     """
     original = masking_utils.create_block_mask
-    masking_utils.create_block_mask = _create_block_mask if compile_block_mask else _eager_create_block_mask
+    builder = _create_block_mask if compile_block_mask else _eager_create_block_mask
+    masking_utils.create_block_mask = partial(builder, BLOCK_SIZE=block_size)
     try:
         yield
     finally:
@@ -166,7 +179,7 @@ def flex_attention_mask_builder(
             device=device,
         )
 
-    with _patched_hf_create_block_mask(compile_block_mask):
+    with _patched_hf_create_block_mask(compile_block_mask, _flex_block_size(device)):
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,

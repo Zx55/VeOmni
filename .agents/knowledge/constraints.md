@@ -230,10 +230,9 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
-    - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
-      The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
-      Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
+27. **MagiAttention is an SM100+ optional extra**
+    - MagiAttention requires `--extra gpu --extra magi` and NVIDIA SM100 or newer.
+      SM90 uses FlexAttention's FA4 backend instead.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.

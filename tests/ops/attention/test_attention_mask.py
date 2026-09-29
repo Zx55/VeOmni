@@ -421,6 +421,45 @@ def test_flex_mask_builder_compiles_create_block_mask_by_default(monkeypatch):
     assert compiled == [flex_mask.create_block_mask]
 
 
+@pytest.mark.parametrize(
+    ("device", "compute_capability", "expected"),
+    [
+        (None, 0, 128),
+        ("cpu", 0, 128),
+        ("cuda", 80, 128),
+        ("cuda", 90, 128),
+        ("cuda", 100, (256, 128)),
+        ("cuda", 110, (256, 128)),
+    ],
+)
+def test_flex_mask_block_size_follows_nvidia_architecture(monkeypatch, device, compute_capability, expected):
+    monkeypatch.setattr(flex_mask.torch.version, "hip", None)
+    monkeypatch.setattr(flex_mask, "get_gpu_compute_capability", lambda selected_device: compute_capability)
+    assert flex_mask._flex_block_size(device) == expected
+
+
+def test_flex_mask_block_size_keeps_rocm_default(monkeypatch):
+    monkeypatch.setattr(flex_mask.torch.version, "hip", "test-rocm")
+    monkeypatch.setattr(flex_mask, "get_gpu_compute_capability", lambda selected_device: 100)
+    assert flex_mask._flex_block_size("cuda") == 128
+
+
+def test_flex_mask_builder_passes_sm100_block_size_to_pytorch(monkeypatch):
+    captured = []
+    real = flex_mask.create_block_mask
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs["BLOCK_SIZE"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(flex_mask, "create_block_mask", spy)
+    monkeypatch.setattr(flex_mask, "_flex_block_size", lambda device: (256, 128))
+    mask = flex_attention_mask_builder(1, 256, 128, device="cpu", compile_block_mask=False)
+    assert isinstance(mask, BlockMask)
+    assert mask.BLOCK_SIZE == (256, 128)
+    assert captured == [(256, 128)]
+
+
 def test_flex_mask_builder_compile_block_mask_false_skips_compile(monkeypatch):
     _reset_flex_compile_cache(monkeypatch)
     compiled = _spy_torch_compile(monkeypatch)

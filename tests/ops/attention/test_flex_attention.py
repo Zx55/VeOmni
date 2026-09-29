@@ -86,7 +86,7 @@ def cleanup_compiled_cuda_state():
     torch.cuda.empty_cache()
 
 
-def _causal_block_mask(sequence_length: int, device: torch.device):
+def _causal_block_mask(sequence_length: int, device: torch.device, block_size: int | tuple[int, int] = 128):
     return create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
@@ -94,7 +94,7 @@ def _causal_block_mask(sequence_length: int, device: torch.device):
         Q_LEN=sequence_length,
         KV_LEN=sequence_length,
         device=device,
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=block_size,
     )
 
 
@@ -299,7 +299,8 @@ def test_flex_attention_cpu_forward_uses_block_mask_and_hf_layout():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention backward requires CUDA")
-def test_flex_attention_short_query_backward_is_finite():
+@pytest.mark.parametrize("block_size", (128, (256, 128)))
+def test_flex_attention_short_query_backward_is_finite(block_size):
     sequence_length = 65
     head_dim = 16
     device = torch.device(get_device_type())
@@ -311,7 +312,7 @@ def test_flex_attention_short_query_backward_is_finite():
         query,
         key,
         value,
-        _causal_block_mask(sequence_length, device),
+        _causal_block_mask(sequence_length, device, block_size),
         kernel_options={"BACKEND": flex_backend.FLEX_BACKEND_TRITON},
     )
     output.float().square().mean().backward()
