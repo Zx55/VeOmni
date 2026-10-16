@@ -82,10 +82,28 @@ output uses `[batch, sequence, heads, head_dim]`.
 
 ## FlexAttention mask contract
 
+### Input layouts and mask semantics
+
 `flex_attention_forward` requires a native
 `torch.nn.attention.flex_attention.BlockMask`. The model owns visibility
 semantics and BlockMask construction; the generic op does not convert a dense
 mask or construct model-specific visibility rules.
+
+Flex additionally accepts 3D Q/K/V in `[tokens, heads, head_dim]` layout and
+returns `[tokens, heads, value_head_dim]`. All three inputs must have the same
+ndim. The adapter normalizes 3D inputs to `[1, heads, tokens, head_dim]` using
+views before Ulysses and backend selection. It does not infer axis order from
+sizes: `[heads, tokens, head_dim]` and 4D `[batch, tokens, heads, head_dim]` are
+not accepted layout conventions. Packed 3D inputs are one concatenated stream;
+the supplied BlockMask defines document isolation. Q and K lengths can differ,
+but K/V heads and lengths, Q/K head dimensions, and batch sizes must match.
+
+Both layouts use the same 4D kernel wrapper. FLASH mask bounds are checked
+against actual Q/K lengths after any Ulysses exchange, including already
+exchanged inputs supplied with `skip_ulysses=True`. Outputs are restored to the
+caller's layout after inverse exchange. When Triton returns LSE, it has shape
+`[heads, tokens]` for 3D input and `[batch, heads, sequence]` for 4D input; FLASH
+continues to return `None` for LSE.
 
 Transformers models may pass `sliding_window` metadata alongside a native
 BlockMask whose predicate already encodes the window. The adapter accepts but
@@ -93,6 +111,8 @@ does not use that integer metadata to reconstruct or alter visibility; the
 supplied BlockMask remains the sole mask authority. Calls without a native
 BlockMask are rejected. Dropout and remaining kernel validation are delegated
 to the pinned Transformers/PyTorch FlexAttention adapter.
+
+### Backend selection
 
 `veomni_flex_attention` stays one public NVIDIA GPU op. The adapter selects
 PyTorch's FLASH backend (CuteDSL wrapping FA4) on SM90 and newer when FA4 is
@@ -105,13 +125,37 @@ because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
 LSE renormalization, so they stay on Triton unless FLASH was forced, which
 is rejected.
 
+### Dynamic compilation
+
+FLASH calls always compile a wrapper with `dynamic=True, fullgraph=True`;
+callers do not need a compile-mode parameter. Fixed and variable sequence
+lengths use the same implementation. Inside the wrapper, a shallow `BlockMask`
+takes its sequence lengths from Q/K tensor shapes, preserving all eight sparse
+buffers, `BLOCK_SIZE`, and `mask_mod`. Current FLASH lowering supports these
+shape-derived symbols, while dynamically captured Python integer lengths can
+be rejected.
+
+The adapter requires the original mask bounds to exactly match Q/K lengths
+before entering the wrapper. Logical/truncated bounds and special no-op masks
+with different bounds are rejected; build a mask for the actual Q/K lengths.
+This does not add padding or change visibility. The Transformers Triton path
+retains its existing compilation behavior.
+
+`fullgraph=True` makes cache exhaustion raise instead of falling back to eager
+dense attention. The dynamic wrapper supports attention within an eager caller.
+An outer `torch.compile(dynamic=True)` can change symbol provenance through the
+bounds check and remains unsupported; outer static compilation has a dedicated
+GPU regression. Additional Python scalar captures in custom mask/score callbacks
+are not normalized by this wrapper. Keep per-sample geometry in tensors;
+dtype, head dimensions and other guards can still produce specializations.
+
 Keep `mask_mod` / `mask_function` a fixed predicate. Encode per-batch
 geometry in captured tensors such as document ids, span ids, or
-`cu_seqlens`, and reuse the same callable. FA4 lowers `mask_mod` into
-CuteDSL with `dynamic=False`, so Python constants inside the predicate are
-compile-time specializations. Baking a new split as `q < 256` retraces on
-every unique layout. Changing tensor *values* with the same program does
-not. `flex_attention_mask_builder` compiles `create_block_mask` around
+`cu_seqlens`, and reuse the same callable. Python constants inside the predicate
+can specialize static programs or become unsupported captures in dynamic FLASH.
+Baking a new split as `q < 256` can retrace or fail on new layouts. Tensor
+*values* can change without changing the predicate program.
+`flex_attention_mask_builder` compiles `create_block_mask` around
 whatever callable the caller passes. It does not rewrite a per-step range
 list into a stable predicate.
 
@@ -127,6 +171,46 @@ def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
     )
     return same_document & (causal | same_full_span)
 ```
+
+### FA4 partial-tile compatibility
+
+For pinned FA4 `4.0.0b16`, VeOmni installs a compatibility forwarder before
+compilation to protect auxiliary mask metadata on partial tiles. Later sparse
+KV blocks can disable sequence bounds checks even when the query tile contains
+padded rows. For custom auxiliary callbacks in the native noncausal/nonlocal
+path, the forwarder restores `mask_seqlen=True`. The original method then wraps
+callback indices into the valid range before metadata reads, and masks padded
+positions to negative infinity using their original indices. Valid-token
+visibility and sparse buffers remain unchanged. Causal visibility expressed
+through a custom Flex callback still uses this native callback path.
+
+Although installation runs when VeOmni's Flex adapter is imported, the forwarder
+replaces FA4's shared native method. Direct FA4 calls in the same process also
+receive the correction when they use the affected auxiliary callback path.
+Ordinary VeOmni `flash_attention_4` calls do not supply `mask_mod` or
+`aux_tensors`; their native causal/window/varlen paths do not trigger this defect.
+Standalone FA4 programs that do not import VeOmni do not receive this local fix.
+
+Corrected forward/backward kernels use a separate, versioned FA4 JIT-cache
+namespace because FA4's package-source fingerprint excludes the repository
+forwarder. This prevents preexisting in-memory or persisted kernels from
+bypassing the correction. Bump the namespace revision whenever shader semantics
+change. Old cache objects remain referenced, and both replacement caches are
+prepared before installation is published; initialization failure can be retried.
+
+Installation requires the exact pinned package version and expected signature,
+and safely skips missing optional dependencies. H20 SM90 passed the combined
+eight-case regression and allocator-disabled memcheck with zero errors. Finite
+numerics and allocator-enabled memcheck alone cannot establish memory safety;
+use `PYTORCH_NO_CUDA_MEMORY_CACHING=1` for this check. The shared `apply_mask`
+method also serves SM80, which has not been hardware-tested here; SM100's
+separate method is not replaced. Re-evaluate the compatibility layer when
+upgrading FA4; skipping another version does not establish that it fixes the
+defect.
+
+The correction adds no bounds buffer, extra kernel launch or synchronization.
+Native index wrapping and bounds checks can add instructions; their kernel and
+end-to-end throughput impact has not been benchmarked.
 
 ## MagiAttention mask and execution contract
 

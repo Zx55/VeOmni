@@ -117,9 +117,9 @@ def flex_attention_mask_builder(
 
     Keep ``mask_function`` a fixed predicate. Put per-step geometry in
     captured tensors (document ids, span ids, ``cu_seqlens``) and reuse the
-    same callable. FA4 compiles ``mask_mod`` with ``dynamic=False`` and
-    specializes on Python constants. A new closure that bakes changing
-    range endpoints as ints retraces CuteDSL on every unique layout.
+    same callable. Captured Python constants can specialize static FA4
+    programs or be rejected by dynamic FLASH lowering. A new closure that
+    bakes changing range endpoints as ints can retrace or fail on new layouts.
 
     A packed prefix-plus-causal mask can keep one callable and refresh two
     ``int32 [S]`` buffers each step::

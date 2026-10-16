@@ -35,6 +35,10 @@ from ..ulysses import (
     should_apply_ulysses,
     slice_ulysses_head_auxiliary,
 )
+from .fa4_sm90_compat import install_fa4_sm90_aux_bounds_fix
+
+
+install_fa4_sm90_aux_bounds_fix()
 
 
 FLEX_BACKEND_FLASH = "FLASH"
@@ -62,14 +66,34 @@ def _flash_attn_cute_available() -> bool:
     return True
 
 
+def _flex_attention_with_tensor_lengths(query, key, value, *, block_mask, **kwargs):
+    """Bind mask bounds to tensor shapes without changing visibility or buffers.
+
+    FLASH accepts shape-derived symbols, but rejects dynamic Python integers
+    captured by Flex's safe-indexing mask wrapper. Reading the caller's integer
+    seq_lengths there creates such captures even for a tensor-only mask_mod.
+    The caller validates exact lengths before entering this compiled function.
+    """
+    block_mask = BlockMask(
+        seq_lengths=(query.shape[-2], key.shape[-2]),
+        kv_num_blocks=block_mask.kv_num_blocks,
+        kv_indices=block_mask.kv_indices,
+        full_kv_num_blocks=block_mask.full_kv_num_blocks,
+        full_kv_indices=block_mask.full_kv_indices,
+        q_num_blocks=block_mask.q_num_blocks,
+        q_indices=block_mask.q_indices,
+        full_q_num_blocks=block_mask.full_q_num_blocks,
+        full_q_indices=block_mask.full_q_indices,
+        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        mask_mod=block_mask.mask_mod,
+    )
+    return raw_flex_attention(query, key, value, block_mask=block_mask, **kwargs)
+
+
 @cache
 def _compiled_flex_attention_fa4():
-    """Compile FlexAttention once with static shapes for the FA4 path.
-
-    Hugging Face's shared ``WrappedFlexAttention`` uses the default dynamic
-    compile. FLASH cannot inline symbolic BlockMask scalars into CuteDSL.
-    """
-    return torch.compile(raw_flex_attention, dynamic=False)
+    """Reuse variable-length FLASH graphs; raise instead of falling back to dense eager attention."""
+    return torch.compile(_flex_attention_with_tensor_lengths, dynamic=True, fullgraph=True)
 
 
 def _flex_attention_fa4(
@@ -115,7 +139,9 @@ def _flex_attention_fa4(
         value = repeat_kv(value, query.shape[1] // value.shape[1])
         enable_gqa = False
 
-    flex_fn = raw_flex_attention if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
+    if (query.shape[-2], key.shape[-2]) != attention_mask.seq_lengths:
+        raise ValueError("Flex-FA4 requires BlockMask sequence lengths to match query/key lengths exactly.")
+    flex_fn = _flex_attention_with_tensor_lengths if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
     attention_output = flex_fn(
         query,
         key,
@@ -220,6 +246,31 @@ def resolve_flex_attention(
     return _flex_attention_triton
 
 
+def _normalize_flex_qkv(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Normalize THD or BHSD inputs to BHSD without guessing axis order."""
+    if query.ndim not in (3, 4) or key.ndim != query.ndim or value.ndim != query.ndim:
+        raise ValueError("FlexAttention requires Q/K/V with the same ndim: 3D [T,H,D] or 4D [B,H,S,D].")
+    if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
+        raise ValueError("FlexAttention does not support query/key/value tensors with zero dimensions.")
+    token_major = query.ndim == 3
+    if token_major:
+        query, key, value = (tensor.transpose(0, 1).unsqueeze(0) for tensor in (query, key, value))
+    if query.shape[0] != key.shape[0] or key.shape[0] != value.shape[0]:
+        raise ValueError("FlexAttention requires matching Q/K/V batch sizes.")
+    if key.shape[1] != value.shape[1] or key.shape[2] != value.shape[2]:
+        raise ValueError("FlexAttention requires matching K/V head counts and sequence lengths.")
+    if query.shape[-1] != key.shape[-1]:
+        raise ValueError("FlexAttention requires matching Q/K head dimensions.")
+    if query.shape[1] % key.shape[1] != 0:
+        raise ValueError(
+            f"FlexAttention GQA requires query heads ({query.shape[1]}) to be divisible by "
+            f"key/value heads ({key.shape[1]})."
+        )
+    return query, key, value, token_major
+
+
 def flex_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -235,19 +286,15 @@ def flex_attention_forward(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the Transformers FlexAttention adapter with optional Ulysses exchange.
 
+    Inputs are BHSD (4D) or THD (3D); outputs are BSHD or THD, respectively.
+    Token-major inputs describe a single token stream, with packing in the mask.
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 
-    if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
-        raise ValueError("FlexAttention does not support query/key/value tensors with zero dimensions.")
-    if query.shape[1] % key.shape[1] != 0:
-        raise ValueError(
-            f"FlexAttention GQA requires query heads ({query.shape[1]}) to be divisible by "
-            f"key/value heads ({key.shape[1]})."
-        )
+    query, key, value, token_major = _normalize_flex_qkv(query, key, value)
 
     # Transformers models may pass ``sliding_window`` metadata together with a
     # BlockMask that already encodes the window predicate. The BlockMask remains
@@ -313,4 +360,8 @@ def flex_attention_forward(
             ).squeeze(-1)
             lse = lse.transpose(1, 2).contiguous()
 
+    if token_major:
+        output = output.squeeze(0)
+        if lse is not None:
+            lse = lse.squeeze(0)
     return output, lse

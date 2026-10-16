@@ -239,3 +239,19 @@ Core files:
     - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
     - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
     - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+
+## FlexAttention
+
+29. **FLASH compilation uses tensor-derived bounds**
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
+
+29a. **Q/K/V layouts and visibility are explicit**
+    - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
+    - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
+
+29b. **Pinned FA4 auxiliary callbacks require bounds protection**
+    - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
+    - Use versioned JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
+    - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.
