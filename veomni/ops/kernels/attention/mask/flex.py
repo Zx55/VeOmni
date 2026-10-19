@@ -34,20 +34,38 @@ from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
 
-def _eager_create_block_mask(*args, **kwargs):
-    """Keep ``create_block_mask`` uncompiled.
+_COMPILED_CREATE_BLOCK_MASK = None
 
-    Transformers still passes ``_compile=True`` on torch>=2.6. Compiled
-    ``create_block_mask`` belongs on the magi-vs-flex branch, not here.
-    """
+
+def _compiled_create_block_mask():
+    """Return a cached ``torch.compile(create_block_mask)``."""
+    global _COMPILED_CREATE_BLOCK_MASK
+    if _COMPILED_CREATE_BLOCK_MASK is None:
+        _COMPILED_CREATE_BLOCK_MASK = torch.compile(create_block_mask)
+    return _COMPILED_CREATE_BLOCK_MASK
+
+
+def _create_block_mask(*args, **kwargs):
+    """Compiled ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
+    kwargs["_compile"] = False
+    return _compiled_create_block_mask()(*args, **kwargs)
+
+
+def _eager_create_block_mask(*args, **kwargs):
+    """Eager ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
     kwargs["_compile"] = False
     return create_block_mask(*args, **kwargs)
 
 
 @contextmanager
-def _eager_hf_create_block_mask() -> Iterator[None]:
+def _patched_hf_create_block_mask(compile_block_mask: bool) -> Iterator[None]:
+    """Swap HF's ``create_block_mask`` for the compiled or eager path.
+
+    Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
+    path cannot use the raw function or the flag would compile anyway.
+    """
     original = masking_utils.create_block_mask
-    masking_utils.create_block_mask = _eager_create_block_mask
+    masking_utils.create_block_mask = _create_block_mask if compile_block_mask else _eager_create_block_mask
     try:
         yield
     finally:
@@ -65,6 +83,7 @@ def flex_attention_mask_builder(
     skip_ulysses: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
+    compile_block_mask: bool = True,
     **kwargs,
 ) -> BlockMask:
     """Build a Transformers FlexAttention mask.
@@ -78,6 +97,27 @@ def flex_attention_mask_builder(
     require an additional 2D mask.
     Canonical masks can be rebuilt from global lengths; custom predicates
     require global metadata.
+
+    ``create_block_mask`` is compiled by default so the eager dense
+    ``[B, H, Q, KV]`` materialization can be fused. Pass
+    ``compile_block_mask=False`` to keep the uncompiled path.
+
+    Keep ``mask_function`` a fixed predicate. Put per-step geometry in
+    captured tensors (document ids, span ids, ``cu_seqlens``) and reuse the
+    same callable. FA4 compiles ``mask_mod`` with ``dynamic=False`` and
+    specializes on Python constants. A new closure that bakes changing
+    range endpoints as ints retraces CuteDSL on every unique layout.
+
+    A packed prefix-plus-causal mask can keep one callable and refresh two
+    ``int32 [S]`` buffers each step::
+
+        def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+            same_document = document_ids[q_idx] == document_ids[kv_idx]
+            causal = q_idx >= kv_idx
+            same_full_span = (full_span_ids[q_idx] >= 0) & (
+                full_span_ids[q_idx] == full_span_ids[kv_idx]
+            )
+            return same_document & (causal | same_full_span)
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:
@@ -127,7 +167,7 @@ def flex_attention_mask_builder(
             batch_size=batch_size,
         )
 
-    with _eager_hf_create_block_mask():
+    with _patched_hf_create_block_mask(compile_block_mask):
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,

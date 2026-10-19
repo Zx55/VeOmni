@@ -24,14 +24,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import create_block_mask
 
-from tests.ops.attention.attention_cases import (
-    clone_qkv,
-    dense_mask,
-    eager_create_block_mask,
-    flex_mask,
-    math_sdpa_reference,
-)
+from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import (
     ATTN_ATOL,
@@ -91,7 +86,7 @@ def cleanup_compiled_cuda_state():
 
 
 def _causal_block_mask(sequence_length: int, device: torch.device):
-    return eager_create_block_mask(
+    return create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
         H=None,
@@ -100,6 +95,183 @@ def _causal_block_mask(sequence_length: int, device: torch.device):
         device=device,
         BLOCK_SIZE=128,
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "device_type",
+        "compute_capability",
+        "cute_available",
+        "backend",
+        "attention_sinks",
+        "expected",
+    ),
+    [
+        ("cpu", 0, True, None, False, flex_backend.FLEX_BACKEND_TRITON),
+        ("cuda", 80, True, None, False, flex_backend.FLEX_BACKEND_TRITON),
+        ("cuda", 90, True, None, False, flex_backend.FLEX_BACKEND_FLASH),
+        ("cuda", 90, False, None, False, flex_backend.FLEX_BACKEND_TRITON),
+        ("cuda", 90, True, None, True, flex_backend.FLEX_BACKEND_TRITON),
+        ("cuda", 100, True, None, False, flex_backend.FLEX_BACKEND_FLASH),
+        ("cuda", 90, True, "TRITON", False, flex_backend.FLEX_BACKEND_TRITON),
+        ("cuda", 80, True, "FLASH", False, flex_backend.FLEX_BACKEND_FLASH),
+    ],
+)
+def test_resolve_flex_attention(
+    monkeypatch,
+    device_type,
+    compute_capability,
+    cute_available,
+    backend,
+    attention_sinks,
+    expected,
+):
+    monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: compute_capability)
+    monkeypatch.setattr(flex_backend, "_flash_attn_cute_available", lambda: cute_available)
+    kernel_options = {} if backend is None else {"BACKEND": backend}
+    interface = flex_backend.resolve_flex_attention(
+        torch.device(device_type),
+        kernel_options,
+        attention_sinks=attention_sinks,
+    )
+    if expected == flex_backend.FLEX_BACKEND_FLASH:
+        assert interface is flex_backend._flex_attention_fa4
+    else:
+        assert interface is flex_backend._flex_attention_triton
+    assert kernel_options["BACKEND"] == expected
+
+
+def test_resolve_flex_attention_keeps_fp32_on_triton_on_sm90(monkeypatch):
+    monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: 90)
+    monkeypatch.setattr(flex_backend, "_flash_attn_cute_available", lambda: True)
+    kernel_options = {}
+    interface = flex_backend.resolve_flex_attention(
+        torch.device("cuda"),
+        kernel_options,
+        query_dtype=torch.float32,
+    )
+    assert interface is flex_backend._flex_attention_triton
+    assert kernel_options["BACKEND"] == flex_backend.FLEX_BACKEND_TRITON
+
+
+def test_resolve_flex_attention_keeps_non_multiple_of_32_head_dim_on_triton(monkeypatch):
+    monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: 90)
+    monkeypatch.setattr(flex_backend, "_flash_attn_cute_available", lambda: True)
+    kernel_options = {}
+    interface = flex_backend.resolve_flex_attention(
+        torch.device("cuda"),
+        kernel_options,
+        query_dtype=torch.bfloat16,
+        head_dim=16,
+    )
+    assert interface is flex_backend._flex_attention_triton
+    assert kernel_options["BACKEND"] == flex_backend.FLEX_BACKEND_TRITON
+
+
+def test_resolve_flex_attention_keeps_multiple_of_32_head_dim_on_flash(monkeypatch):
+    monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: 90)
+    monkeypatch.setattr(flex_backend, "_flash_attn_cute_available", lambda: True)
+    kernel_options = {}
+    interface = flex_backend.resolve_flex_attention(
+        torch.device("cuda"),
+        kernel_options,
+        query_dtype=torch.bfloat16,
+        head_dim=64,
+    )
+    assert interface is flex_backend._flex_attention_fa4
+    assert kernel_options["BACKEND"] == flex_backend.FLEX_BACKEND_FLASH
+
+
+def test_flex_attention_recasts_fp32_qkv_to_module_weight_dtype(monkeypatch):
+    captured = {}
+
+    def fake_flash(module, query, key, value, attention_mask, **kwargs):
+        del module, key, value, attention_mask, kwargs
+        captured["dtype"] = query.dtype
+        return query.transpose(1, 2), None
+
+    def fake_resolve(device, kernel_options, **kwargs):
+        del device
+        captured["query_dtype"] = kwargs.get("query_dtype")
+        kernel_options["BACKEND"] = flex_backend.FLEX_BACKEND_FLASH
+        return fake_flash
+
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    monkeypatch.setattr(flex_backend, "resolve_flex_attention", fake_resolve)
+
+    class Module(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_attn_implementation="veomni_flex_attention")
+            self.proj = nn.Linear(8, 8)
+
+    module = Module()
+    module.proj.to(dtype=torch.bfloat16)
+    query = torch.randn(1, 2, 8, 8)
+    flex_backend.flex_attention_forward(
+        module,
+        query,
+        query,
+        query,
+        _causal_block_mask(8, query.device),
+    )
+    assert captured["dtype"] == torch.bfloat16
+    assert captured["query_dtype"] == torch.bfloat16
+
+
+def test_resolve_flex_attention_rejects_forced_flash_with_sinks():
+    with pytest.raises(ValueError, match="does not support attention sinks"):
+        flex_backend.resolve_flex_attention(
+            torch.device("cpu"),
+            {"BACKEND": flex_backend.FLEX_BACKEND_FLASH},
+            attention_sinks=True,
+        )
+
+
+def test_flex_attention_rejects_forced_flash_with_sinks(monkeypatch):
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    query = torch.randn(1, 4, 8, 8)
+    with pytest.raises(ValueError, match="does not support attention sinks"):
+        flex_backend.flex_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            _causal_block_mask(8, query.device),
+            kernel_options={"BACKEND": flex_backend.FLEX_BACKEND_FLASH},
+            s_aux=torch.ones(query.shape[1]),
+        )
+
+
+def test_flex_attention_flash_backend_skips_hf_lse_path(monkeypatch):
+    captured = {}
+
+    def fake_flash(module, query, key, value, attention_mask, **kwargs):
+        captured["kernel_options"] = kwargs["kernel_options"]
+        return query.transpose(1, 2), None
+
+    def fail_hf(*args, **kwargs):
+        raise AssertionError("FLASH path must not request LSE through the HF adapter")
+
+    def fake_resolve(device, kernel_options, **kwargs):
+        del device, kwargs
+        kernel_options["BACKEND"] = flex_backend.FLEX_BACKEND_FLASH
+        return fake_flash
+
+    monkeypatch.setattr(flex_backend, "resolve_flex_attention", fake_resolve)
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", fail_hf)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    query = torch.randn(1, 4, 8, 8)
+    output, auxiliary = flex_backend.flex_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query,
+        query,
+        _causal_block_mask(8, query.device),
+    )
+    assert captured["kernel_options"] == {"BACKEND": flex_backend.FLEX_BACKEND_FLASH}
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert auxiliary is None
 
 
 @pytest.mark.skipif(
@@ -143,6 +315,7 @@ def test_flex_attention_short_query_backward_is_finite():
         key,
         value,
         _causal_block_mask(sequence_length, device),
+        kernel_options={"BACKEND": flex_backend.FLEX_BACKEND_TRITON},
     )
     output.float().square().mean().backward()
     assert output.shape == (1, sequence_length, 2, head_dim)
@@ -181,7 +354,7 @@ def test_flex_attention_rejects_unsupported_masks(monkeypatch):
         with pytest.raises(TypeError, match="requires a BlockMask"):
             flex_backend.flex_attention_forward(module, query, query, query, unsupported_mask, sliding_window=4)
 
-    head_specific_mask = eager_create_block_mask(
+    head_specific_mask = create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
         H=query.shape[1],
@@ -203,10 +376,10 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
         captured["kwargs"] = kwargs
         return query.transpose(1, 2), None
 
-    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", fake_backend)
     monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 4, 8, 8)
-    block_mask = eager_create_block_mask(
+    block_mask = create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: (query_idx >= key_idx) & (query_idx - key_idx < 4),
         B=None,
         H=None,
@@ -225,29 +398,9 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
     )
     assert captured["attention_mask"] is block_mask
     assert "sliding_window" not in captured["kwargs"]
-    assert captured["kwargs"]["kernel_options"] == {}
+    assert captured["kwargs"]["kernel_options"] == {"BACKEND": "TRITON"}
     torch.testing.assert_close(output, query.transpose(1, 2))
     assert auxiliary is None
-
-
-def test_flex_attention_cpu_forward_does_not_pin_triton_backend(monkeypatch):
-    captured = {}
-
-    def fake_backend(module, query, key, value, attention_mask, **kwargs):
-        captured["kwargs"] = kwargs
-        return query.transpose(1, 2), None
-
-    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
-    query = torch.randn(1, 4, 8, 8)
-    flex_backend.flex_attention_forward(
-        _FakeAttentionModule(),
-        query,
-        query,
-        query,
-        _causal_block_mask(8, query.device),
-    )
-    assert "BACKEND" not in captured["kwargs"]["kernel_options"]
 
 
 def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
@@ -263,7 +416,7 @@ def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(flex_backend, "prepare_ulysses_qkv", recorder.prepare)
     monkeypatch.setattr(flex_backend, "slice_ulysses_head_auxiliary", recorder.slice_auxiliary)
-    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", fake_backend)
     monkeypatch.setattr(flex_backend, "restore_ulysses_output", recorder.restore)
     query = torch.randn(1, 4, 8, 8)
     key = torch.randn(1, 2, 8, 8)
@@ -300,7 +453,7 @@ def test_flex_attention_skip_ulysses_skips_exchange(monkeypatch):
         captured["kwargs"] = kwargs
         return query.transpose(1, 2), None
 
-    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", fake_backend)
     query = torch.randn(1, 4, 8, 8)
     flex_backend.flex_attention_forward(
         _FakeAttentionModule(),
@@ -346,8 +499,11 @@ def test_flex_attention_matches_math_sdpa(mask_case):
     flex_gradients = torch.autograd.grad(flex_output, flex_qkv, output_gradient)
 
     torch.testing.assert_close(flex_output, reference_output, rtol=ATTN_RTOL, atol=ATTN_ATOL)
-    assert flex_lse is not None
-    torch.testing.assert_close(flex_lse.float(), reference_lse.float(), rtol=ATTN_LSE_RTOL, atol=ATTN_ATOL)
+    if flex_backend.resolve_flex_attention(device, {}) is flex_backend._flex_attention_fa4:
+        assert flex_lse is None
+    else:
+        assert flex_lse is not None
+        torch.testing.assert_close(flex_lse.float(), reference_lse.float(), rtol=ATTN_LSE_RTOL, atol=ATTN_ATOL)
     for name, flex_gradient, reference_gradient in zip(
         ("query", "key", "value"),
         flex_gradients,
@@ -399,8 +555,11 @@ def test_flex_toy_layer_matches_math_sdpa(dtype, cleanup_compiled_cuda_state):
     flex_logits = flex_layer.o_proj(flex_output.reshape(1, sequence_length, query_heads * head_dim))
 
     torch.testing.assert_close(flex_logits, math_logits, rtol=ATTN_RTOL, atol=ATTN_ATOL)
-    assert flex_lse is not None
-    assert torch.isfinite(flex_lse).all()
+    if flex_backend.resolve_flex_attention(device, {}) is flex_backend._flex_attention_fa4:
+        assert flex_lse is None
+    else:
+        assert flex_lse is not None
+        assert torch.isfinite(flex_lse).all()
     math_gradients = torch.autograd.grad(math_logits, (math_hidden, *math_layer.parameters()), output_gradient)
     flex_gradients = torch.autograd.grad(flex_logits, (flex_hidden, *flex_layer.parameters()), output_gradient)
     gradient_atol = ATTN_BF16_GRAD_ATOL if dtype == torch.bfloat16 else ATTN_GRAD_ATOL

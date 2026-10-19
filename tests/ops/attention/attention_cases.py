@@ -27,7 +27,8 @@ from veomni.ops.mask import MagiAttentionMask
 def eager_create_block_mask(*args, **kwargs):
     """Build a BlockMask without compiling ``create_block_mask``.
 
-    Compiled ``create_block_mask`` belongs on magi-vs-flex, not this branch.
+    Production Flex compiles the builder by default. Tests keep this helper
+    eager so unit collection does not pay for compiled mask construction.
     """
     kwargs["_compile"] = False
     return create_block_mask(*args, **kwargs)
