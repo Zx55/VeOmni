@@ -260,3 +260,24 @@ Core files:
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
     - Full RoPE eager and Liger adapters normalize fixed tables saved for backward to `q.dtype`, independently of the forward compute tables. Trainable tables retain the eager gradient path.
     - Cover both table-dtype change directions and text/vision layouts in `tests/ops/rope/test_rope.py`. `tests/models/transformers/qwen/test_qwen2_vl.py` additionally runs the default Liger vision path with real two-rank FSDP2 and BF16 mixed precision.
+
+## FlexAttention
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
+30. **FLASH compilation uses tensor-derived bounds**
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - Prefer indexed per-token metadata buffers. The pinned CuteDSL lowering can also fail on zero-dimensional scalar-tensor captures; converting a Python scalar to a scalar tensor alone does not establish callback compatibility.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
+
+30a. **Q/K/V layouts and visibility are explicit**
+    - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
+    - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
+
+30b. **Pinned FA4 auxiliary callbacks require bounds protection**
+    - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
+    - Add protection only on physically padded Q tiles (account for PackGQA). Q-only callback clamping requires a proven complete K tile; ragged/negative K tiles retain native full bounds. Never use the incoming false flag as proof of K bounds.
+    - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
+    - Native b16 still assumes sparse-list ordering on complete Q tiles and omits Q/K/V strides from its forward cache key. Isolated head/layout bounds tests do not establish arbitrary mixed-layout production cache reuse.
+    - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.

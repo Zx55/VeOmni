@@ -12,167 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlexAttention backend and SP-aware adapter implementation."""
+"""Flex adapter entry points, backend routing, and Ulysses coordination."""
 
 from collections.abc import Callable
-from functools import cache
 from typing import Optional
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
-from torch.nn.attention.flex_attention import flex_attention as raw_flex_attention
-from transformers.integrations.flex_attention import (
-    flex_attention_forward as _flex_attention_triton,
-)
-from transformers.integrations.flex_attention import get_flex_attention_lse_kwargs, repeat_kv
-from transformers.utils.import_utils import is_torchdynamo_compiling
+from transformers.integrations.flex_attention import flex_attention_forward as _flex_attention_triton
 
-from .....distributed.parallel_state import get_parallel_state
-from .....utils.device import get_gpu_compute_capability
-from ..ulysses import (
+from ......distributed.parallel_state import get_parallel_state
+from ......utils.device import get_gpu_compute_capability
+from ...ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
     slice_ulysses_head_auxiliary,
 )
+from . import _fa4
+from ._fa4 import _flex_attention_fa4
+from ._inputs import _maybe_recast_qkv_for_fa4, _normalize_flex_qkv
 
 
 FLEX_BACKEND_FLASH = "FLASH"
 FLEX_BACKEND_TRITON = "TRITON"
 _HOPPER_MIN_CC = 90
-_FA4_DTYPES = frozenset(
-    dtype
-    for dtype in (
-        torch.float16,
-        torch.bfloat16,
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e5m2", None),
-    )
-    if dtype is not None
-)
-
-
-@cache
-def _flash_attn_cute_available() -> bool:
-    """Return whether PyTorch's FLASH Flex backend can import FA4."""
-    try:
-        import flash_attn.cute  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-@cache
-def _compiled_flex_attention_fa4():
-    """Compile FlexAttention once with static shapes for the FA4 path.
-
-    Hugging Face's shared ``WrappedFlexAttention`` uses the default dynamic
-    compile. FLASH cannot inline symbolic BlockMask scalars into CuteDSL.
-    """
-    return torch.compile(raw_flex_attention, dynamic=False)
-
-
-def _flex_attention_fa4(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: BlockMask,
-    *,
-    dropout: float,
-    scaling: Optional[float],
-    softcap: Optional[float],
-    kernel_options: dict,
-    position_bias: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    """Run compiled FlexAttention without requesting LSE.
-
-    FLASH backward does not support dLSE. Keep this path free of
-    ``return_lse`` / ``AuxRequest(lse=True)`` so SM90 training can use FA4.
-    """
-    del module, kwargs
-    if dropout > 0:
-        raise ValueError(
-            "`flex_attention` does not support `dropout`. Please use it with inference"
-            " only (`model.eval()`) or turn off the attention dropout in the respective config."
-        )
-
-    score_mod = None
-    if softcap is not None or position_bias is not None:
-
-        def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-            if softcap is not None:
-                score = softcap * torch.tanh(score / softcap)
-            if position_bias is not None:
-                score = score + position_bias[batch_idx, head_idx, q_idx, kv_idx]
-            return score
-
-    enable_gqa = True
-    num_local_query_heads = query.shape[1]
-    if (num_local_query_heads & (num_local_query_heads - 1)) != 0:
-        key = repeat_kv(key, query.shape[1] // key.shape[1])
-        value = repeat_kv(value, query.shape[1] // value.shape[1])
-        enable_gqa = False
-
-    flex_fn = raw_flex_attention if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
-    attention_output = flex_fn(
-        query,
-        key,
-        value,
-        score_mod=score_mod,
-        block_mask=attention_mask,
-        enable_gqa=enable_gqa,
-        scale=scaling,
-        kernel_options=kernel_options,
-        **get_flex_attention_lse_kwargs(False),
-    )
-    return attention_output.transpose(1, 2).contiguous(), None
-
-
-def _flex_fa4_compute_dtype(module: torch.nn.Module, query: torch.Tensor) -> torch.dtype:
-    """Recover the compute dtype when LayerNorm left QKV in fp32.
-
-    Matches the flash adapter: autocast, then a quantized config hint, then the
-    first Linear weight. A fully fp32 module stays fp32.
-    """
-    if query.dtype != torch.float32:
-        return query.dtype
-    if torch.is_autocast_enabled():
-        return torch.get_autocast_gpu_dtype()
-    config = getattr(module, "config", None)
-    pre_quant = getattr(config, "_pre_quantization_dtype", None)
-    if pre_quant is not None:
-        return pre_quant
-    linear = next((layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)), None)
-    if linear is not None:
-        return linear.weight.dtype
-    return query.dtype
-
-
-def _maybe_recast_qkv_for_fa4(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cast fp32 QKV back to a FA4-legal dtype when the module is low precision."""
-    target_dtype = _flex_fa4_compute_dtype(module, query)
-    if target_dtype == query.dtype:
-        return query, key, value
-    return query.to(target_dtype), key.to(target_dtype), value.to(target_dtype)
-
-
-def _dtype_supports_flex_fa4(dtype: torch.dtype) -> bool:
-    return dtype in _FA4_DTYPES
-
-
-def _head_dim_supports_flex_fa4(head_dim: int) -> bool:
-    # FA4 cute backward preprocess ICE when hd % 32 != 0
-    # (Dao-AILab/flash-attention#2492). hd % 32 == 0 skips the OOB
-    # predicate and can train. TODO: drop this gate after upgrading
-    # past flash-attn 4.0.0b16 once #2518 / #2698 land in the wheel.
-    return head_dim % 32 == 0
 
 
 def resolve_flex_attention(
@@ -205,11 +69,11 @@ def resolve_flex_attention(
             )
     elif attention_sinks or device.type != "cuda":
         backend = FLEX_BACKEND_TRITON
-    elif query_dtype is not None and not _dtype_supports_flex_fa4(query_dtype):
+    elif query_dtype is not None and not _fa4._dtype_supports_flex_fa4(query_dtype):
         backend = FLEX_BACKEND_TRITON
-    elif head_dim is not None and not _head_dim_supports_flex_fa4(head_dim):
+    elif head_dim is not None and not _fa4._head_dim_supports_flex_fa4(head_dim):
         backend = FLEX_BACKEND_TRITON
-    elif get_gpu_compute_capability(device) >= _HOPPER_MIN_CC and _flash_attn_cute_available():
+    elif get_gpu_compute_capability(device) >= _HOPPER_MIN_CC and _fa4._flash_attn_cute_available():
         backend = FLEX_BACKEND_FLASH
     else:
         backend = FLEX_BACKEND_TRITON
@@ -235,19 +99,15 @@ def flex_attention_forward(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the Transformers FlexAttention adapter with optional Ulysses exchange.
 
+    Inputs are BHSD (4D) or THD (3D); outputs are BSHD or THD, respectively.
+    Token-major inputs describe a single token stream, with packing in the mask.
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 
-    if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
-        raise ValueError("FlexAttention does not support query/key/value tensors with zero dimensions.")
-    if query.shape[1] % key.shape[1] != 0:
-        raise ValueError(
-            f"FlexAttention GQA requires query heads ({query.shape[1]}) to be divisible by "
-            f"key/value heads ({key.shape[1]})."
-        )
+    query, key, value, token_major = _normalize_flex_qkv(query, key, value)
 
     # Transformers models may pass ``sliding_window`` metadata together with a
     # BlockMask that already encodes the window predicate. The BlockMask remains
@@ -313,4 +173,8 @@ def flex_attention_forward(
             ).squeeze(-1)
             lse = lse.transpose(1, 2).contiguous()
 
+    if token_major:
+        output = output.squeeze(0)
+        if lse is not None:
+            lse = lse.squeeze(0)
     return output, lse
